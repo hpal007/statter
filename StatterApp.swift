@@ -1121,6 +1121,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
+    /// The menu bar chip, tinted by headroom level. Tinting means the symbol can
+    /// no longer be a template image, so each level is drawn once and cached —
+    /// this runs on every sample.
+    private var chipCache: [MemoryLevel: NSImage] = [:]
+
+    private func chipImage(for level: MemoryLevel) -> NSImage? {
+        if let cached = chipCache[level] { return cached }
+        let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        guard let base = NSImage(systemSymbolName: "memorychip",
+                                 accessibilityDescription: "Statter")?
+            .withSymbolConfiguration(cfg) else { return nil }
+        let tinted = NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            level.nsColor.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.isTemplate = false   // keep the threshold colour
+        chipCache[level] = tinted
+        return tinted
+    }
+
     /// Redraws the menu bar readout. Called on the main queue after each sample.
     func updateStatusItem() {
         guard let button = statusItem.button else { return }
@@ -1132,16 +1154,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let level = MemoryLevel(availableFraction: mem.availableFraction)
         let usedFraction = Double(mem.usedBytes) / Double(mem.totalBytes)
 
-        // Numbers only. Monospaced digits, otherwise the item resizes every
+        // The chip carries the headroom colour; the digits stay in the menu bar's
+        // own label colour so they read like every other item up there rather
+        // than as an alert. Monospaced digits, otherwise the item resizes every
         // 2 seconds and shoves the rest of the menu bar around.
-        button.image = nil
+        button.image = chipImage(for: level)
+        button.imagePosition = .imageLeading
         let usedGB = Double(mem.usedBytes) / 1_073_741_824
         let totalGB = Double(mem.totalBytes) / 1_073_741_824
         button.attributedTitle = NSAttributedString(
-            string: String(format: "%.1f/%.0f GB", usedGB, totalGB),
+            string: String(format: " %.1f/%.0f GB", usedGB, totalGB),
             attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: level.nsColor,
+                .foregroundColor: NSColor.labelColor,
             ]
         )
 

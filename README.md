@@ -6,7 +6,7 @@ SwiftUI menu bar app for monitoring macOS GPU and memory stats.
 
 ## Features
 
-- **Live menu bar numbers** — `10.6/16 GB` in the menu bar, tinted by headroom threshold, so used-vs-total is readable without opening the panel. Hover for the full breakdown.
+- **Live menu bar numbers** — `10.6/16 GB` in the menu bar beside a chip icon that carries the headroom colour (green / orange / red), so the digits stay in the normal menu bar colour and only the icon signals pressure. Hover for the full breakdown.
 - **RAM gets the wide half** of the panel: a thin stick gauge scaled to physical memory with tick marks alongside, the used/total/available figures, and the "where it is going" breakdown, all in one card.
 - **CPU and GPU stack beside it** as compact cards, each with the same thin stick gauge, so all three read on one visual grammar without spending width on chunky bars.
 - **Network throughput** — live download and upload rates from `getifaddrs` byte counters.
@@ -66,8 +66,26 @@ On Apple Silicon, there is no separate VRAM. The CPU and GPU share the same phys
 ## Building
 
 ```bash
+./build.sh            # produces ./Statter.app
+./build.sh --install  # also copies it to /Applications and launches it
+```
+
+`build.sh` compiles `StatterApp.swift`, wraps the binary in a `Statter.app` bundle
+(marked `LSUIElement`, so it lives in the menu bar with no Dock icon) and ad-hoc
+signs it. The icon is drawn from code by `make-icon.swift` — the `memorychip`
+symbol over a capacity bar, cut into a colourless glass plate that picks up whatever
+is behind it — so the repo carries no image assets. `build.sh` runs it automatically when `Statter.icns` is missing; run
+`swift make-icon.swift` by hand after editing the artwork. Ad-hoc signing keeps the bundle identity stable across rebuilds, so macOS
+does not re-ask for permissions every time.
+
+Double-click `Statter.app` to run it, or launch the raw binary for a quick iteration:
+
+```bash
 swiftc -parse-as-library -framework SwiftUI -framework AppKit -framework IOKit -o statter StatterApp.swift
 ./statter
 ```
+
+To have it start at login, add `Statter.app` under System Settings → General →
+Login Items.
 
 Requires macOS and Xcode command line tools (`xcode-select --install`).
