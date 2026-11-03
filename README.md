@@ -14,6 +14,7 @@ SwiftUI menu bar app for monitoring macOS GPU and memory stats.
 - Live Apple Silicon GPU utilization read straight from the `AGXAccelerator` IORegistry entry — no `ioreg` subprocess
 - **Kernel memory pressure** (`kern.memorystatus_vm_pressure_level`) shown in the RAM card and folded into the chip colour
 - **Physical footprint** for per-process memory (the same metric Activity Monitor uses) instead of RSS, which inflates numbers by counting shared pages multiple times
+- **Quit or Force Quit processes from the panel**: hover a row for the quit button, or right-click it for Quit, Force Quit and Copy PIDs. A grouped row such as `node (10)` acts on every process in it. You confirm inline before anything is sent. Apps get a normal quit (with a chance to save); everything else gets `SIGTERM`, and Force Quit uses `SIGKILL`. Each PID's start time is checked before signalling, so a PID that has since been reused by another process is never hit. Processes owned by other users are reported as not permitted.
 - Swap usage with contextual explanation
 - **System-wide CPU utilization** with user/system split and P/E core counts, read from `host_statistics(HOST_CPU_LOAD_INFO)`
 

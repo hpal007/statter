@@ -68,10 +68,18 @@ struct GPUStats: Sendable {
 
 struct ProcessMemory: Identifiable, Sendable {
     let id: String
+    /// Display name, with a count for grouped rows: `node (10)`.
     let name: String
     let pid: Int
     let residentMB: Double
     let cpuPercent: Double
+    /// Executable name every PID in the row was seen under.
+    var executable: String = ""
+    /// Every PID merged into this row; killing the row signals all of them.
+    var pids: [Int] = []
+    /// PID -> start time, captured at scan time. A PID plus its start time
+    /// names one process for good, so a reused PID is never signalled.
+    var startTimes: [Int: UInt64] = [:]
 }
 
 /// `kern.memorystatus_vm_pressure_level` — the same signal the kernel uses to
@@ -434,6 +442,15 @@ func getPhysFootprint(_ pid: Int32) -> UInt64 {
 
 // MARK: - Top Processes by Memory
 
+/// Start time in microseconds since the epoch; nil for processes we may not
+/// inspect (other users' — which we could not signal anyway).
+func processStartTime(_ pid: Int32) -> UInt64? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+}
+
 /// `ps` stays deliberately: proc_pid_rusage / proc_pidinfo are refused for
 /// processes owned by other users (WindowServer, mds_stores, launchd, ~160
 /// daemons), while the system `ps` can still report their RSS. Dropping it
@@ -481,9 +498,10 @@ func readTopProcesses(limit: Int = 30) -> [ProcessMemory]? {
     }
 
     // Aggregate by process name
-    var aggregated: [String: (totalMB: Double, totalCPU: Double, pids: [Int], count: Int)] = [:]
+    var aggregated: [String: (totalMB: Double, totalCPU: Double, pids: [Int], count: Int, starts: [Int: UInt64])] = [:]
     for p in results {
-        var entry = aggregated[p.name] ?? (totalMB: 0, totalCPU: 0, pids: [], count: 0)
+        var entry = aggregated[p.name] ?? (totalMB: 0, totalCPU: 0, pids: [], count: 0, starts: [:])
+        entry.starts[p.pid] = processStartTime(Int32(p.pid))
         entry.totalMB += p.residentMB
         entry.totalCPU += p.cpuPercent
         entry.pids.append(p.pid)
@@ -494,11 +512,79 @@ func readTopProcesses(limit: Int = 30) -> [ProcessMemory]? {
     return aggregated.map { name, data in
         let displayName = data.count > 1 ? "\(name) (\(data.count))" : name
         return ProcessMemory(id: name, name: displayName, pid: data.pids.first ?? 0,
-                      residentMB: data.totalMB, cpuPercent: data.totalCPU)
+                      residentMB: data.totalMB, cpuPercent: data.totalCPU,
+                      executable: name, pids: data.pids.sorted(), startTimes: data.starts)
     }
     .sorted { $0.residentMB > $1.residentMB }
     .prefix(limit)
     .map { $0 }
+}
+
+// MARK: - Killing processes
+
+enum TerminationMode: Sendable {
+    /// Asks politely: apps get a normal quit (and may prompt to save),
+    /// everything else gets SIGTERM.
+    case quit
+    /// Cannot be refused: SIGKILL. Unsaved work is lost.
+    case forceQuit
+
+    var verb: String { self == .quit ? "Quit" : "Force Quit" }
+}
+
+struct TerminationOutcome {
+    var signalled = 0
+    var denied = 0     // EPERM: owned by another user (root, _windowserver, ...)
+    var gone = 0       // exited already, or the PID now belongs to something else
+    var protected = 0  // Statter itself, launchd, kernel_task
+
+    var summary: String {
+        var parts: [String] = []
+        if signalled > 0 { parts.append(signalled == 1 ? "Sent to 1 process" : "Sent to \(signalled) processes") }
+        if denied > 0 { parts.append("\(denied) not permitted (owned by another user)") }
+        if gone > 0 { parts.append("\(gone) already gone") }
+        if protected > 0 { parts.append("\(protected) protected") }
+        return parts.isEmpty ? "Nothing to do" : parts.joined(separator: " \u{2022} ")
+    }
+}
+
+
+/// Processes whose death ends the session rather than just an app.
+let sessionCriticalProcesses: Set<String> = ["loginwindow", "WindowServer"]
+
+@MainActor
+func terminate(_ proc: ProcessMemory, mode: TerminationMode) -> TerminationOutcome {
+    var outcome = TerminationOutcome()
+    let me = getpid()
+    for raw in proc.pids {
+        let pid = pid_t(raw)
+        guard pid > 1, pid != me else { outcome.protected += 1; continue }
+
+        // The list is a few seconds old. If the PID has exited and been reused,
+        // the start time will not match — never signal a stranger. (Names are
+        // no good for this: ps reports argv[0], e.g. `-zsh` or `python` for a
+        // binary called `zsh` or `python3.13`.) Without a recorded start time
+        // we could not inspect the process, and kill() will be refused too.
+        if let expected = proc.startTimes[raw] {
+            guard processStartTime(pid) == expected else { outcome.gone += 1; continue }
+        }
+
+        // GUI apps get the same treatment as Quit / Force Quit in the Dock.
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            let sent = mode == .quit ? app.terminate() : app.forceTerminate()
+            if sent { outcome.signalled += 1; continue }
+        }
+
+        if kill(pid, mode == .quit ? SIGTERM : SIGKILL) == 0 {
+            outcome.signalled += 1
+        } else if errno == EPERM {
+            outcome.denied += 1
+        } else {
+            outcome.gone += 1
+        }
+    }
+    logger.notice("\(mode.verb, privacy: .public) \(proc.executable, privacy: .public) pids \(proc.pids, privacy: .public): \(outcome.summary, privacy: .public)")
+    return outcome
 }
 
 // MARK: - Monitor
@@ -564,6 +650,16 @@ final class SystemMonitor {
                 if let procs { self.processes = self.sortProcesses(procs) }
                 try? await Task.sleep(for: Self.processInterval)
             }
+        }
+    }
+
+    /// After a kill, rescan shortly so the row disappears without waiting for
+    /// the next tick. The delay gives a quitting app a moment to exit.
+    func rescanProcessesSoon() {
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard let self, self.processTask != nil else { return }
+            self.setPanelVisible(true)  // restarts the loop with an immediate scan
         }
     }
 
@@ -647,6 +743,9 @@ struct SortButton: View {
 struct ProcessRowView: View {
     let proc: ProcessMemory
     let maxMB: Double
+    let onTerminate: (TerminationMode) -> Void
+
+    @State private var hovering = false
 
     var body: some View {
         VStack(spacing: 3) {
@@ -655,6 +754,16 @@ struct ProcessRowView: View {
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .lineLimit(1)
                 Spacer()
+                if hovering {
+                    Button { onTerminate(.quit) } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Quit \(proc.executable)\u{2026} (right-click for Force Quit)")
+                    .accessibilityLabel("Quit \(proc.name)")
+                }
                 Text(formatMB(proc.residentMB))
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
             }
@@ -678,6 +787,61 @@ struct ProcessRowView: View {
             }
         }
         .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .contextMenu {
+            Button("Quit \(proc.name)\u{2026}") { onTerminate(.quit) }
+            Button("Force Quit \(proc.name)\u{2026}") { onTerminate(.forceQuit) }
+            Divider()
+            Button(proc.pids.count > 1 ? "Copy PIDs" : "Copy PID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(proc.pids.map(String.init).joined(separator: " "), forType: .string)
+            }
+        }
+    }
+}
+
+/// Inline rather than an alert: a modal would steal focus from the transient
+/// popover and close it.
+struct TerminationConfirmView: View {
+    let proc: ProcessMemory
+    let mode: TerminationMode
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    private var detail: String {
+        var lines: [String] = []
+        let count = proc.pids.count
+        lines.append(count > 1 ? "\(count) processes \u{2022} \(formatMB(proc.residentMB))"
+                               : "PID \(proc.pid) \u{2022} \(formatMB(proc.residentMB))")
+        if sessionCriticalProcesses.contains(proc.executable) {
+            lines.append("This ends your login session.")
+        } else if mode == .forceQuit {
+            lines.append("Unsaved work will be lost.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(mode.verb) \(proc.executable)?")
+                .font(.system(size: 12, weight: .semibold))
+            Text(detail)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button(mode.verb, role: .destructive, action: onConfirm)
+                    .keyboardShortcut(.defaultAction)
+                    .tint(mode == .forceQuit ? .red : nil)
+            }
+            .controlSize(.small)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.red.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.red.opacity(0.25), lineWidth: 1))
     }
 }
 
@@ -786,6 +950,9 @@ struct ContentView: View {
     // Owned by the AppDelegate so the menu bar item and this panel read the
     // same samples.
     @Bindable var monitor: SystemMonitor
+
+    @State private var pendingKill: (proc: ProcessMemory, mode: TerminationMode)?
+    @State private var killMessage: String?
 
     private var availableGB: Double {
         Double(monitor.memoryStats.availableBytes) / 1_073_741_824
@@ -1096,6 +1263,14 @@ struct ContentView: View {
 
     // MARK: Processes (right column)
 
+    private func showKillMessage(_ text: String) {
+        killMessage = text
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            if killMessage == text { killMessage = nil }
+        }
+    }
+
     private var processSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -1127,6 +1302,23 @@ struct ContentView: View {
                 }
             }
 
+            if let pending = pendingKill {
+                TerminationConfirmView(
+                    proc: pending.proc, mode: pending.mode,
+                    onConfirm: {
+                        let outcome = terminate(pending.proc, mode: pending.mode)
+                        pendingKill = nil
+                        showKillMessage(outcome.summary)
+                        monitor.rescanProcessesSoon()
+                    },
+                    onCancel: { pendingKill = nil })
+            } else if let message = killMessage {
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+
             let maxMB = monitor.processes.map(\.residentMB).max() ?? 1.0
 
             if monitor.processes.isEmpty {
@@ -1148,7 +1340,10 @@ struct ContentView: View {
                     // process list refreshes yanks the scroll position.
                     VStack(spacing: 0) {
                         ForEach(monitor.processes) { proc in
-                            ProcessRowView(proc: proc, maxMB: maxMB)
+                            ProcessRowView(proc: proc, maxMB: maxMB) { mode in
+                                pendingKill = (proc, mode)
+                                killMessage = nil
+                            }
                             Divider()
                         }
                     }
