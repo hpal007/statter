@@ -3,6 +3,11 @@ import AppKit
 import Darwin
 import Foundation
 import IOKit
+import os
+
+/// Failed reads go to the unified log (Console.app, subsystem
+/// com.hpal007.statter) instead of silently becoming a plausible zero.
+let logger = Logger(subsystem: "com.hpal007.statter", category: "sampling")
 
 // MARK: - Data Models
 
@@ -11,7 +16,7 @@ import IOKit
 /// `-` on UInt64 can trap at runtime.
 func saturatingSub(_ a: UInt64, _ b: UInt64) -> UInt64 { a > b ? a - b : 0 }
 
-struct MemoryStats {
+struct MemoryStats: Sendable {
     let totalBytes: UInt64
     let usedBytes: UInt64
     let activeBytes: UInt64
@@ -21,6 +26,12 @@ struct MemoryStats {
     let freeBytes: UInt64
     let appBytes: UInt64  // approximate app-associated memory
     let swapUsedBytes: UInt64
+    /// The kernel's own VM pressure level; nil if it could not be read.
+    var pressure: MemoryPressure? = nil
+
+    static let empty = MemoryStats(totalBytes: 0, usedBytes: 0, activeBytes: 0, inactiveBytes: 0,
+                                   wiredBytes: 0, compressedBytes: 0, freeBytes: 0, appBytes: 0,
+                                   swapUsedBytes: 0)
 
     var usedFraction: Double { Double(usedBytes) / Double(max(totalBytes, 1)) }
     var freeFraction: Double { Double(freeBytes) / Double(max(totalBytes, 1)) }
@@ -28,13 +39,13 @@ struct MemoryStats {
     var availableFraction: Double { Double(availableBytes) / Double(max(totalBytes, 1)) }
 }
 
-struct NetworkStats {
+struct NetworkStats: Sendable {
     let downBytesPerSec: Double
     let upBytesPerSec: Double
     let hasBaseline: Bool
 }
 
-struct CPUStats {
+struct CPUStats: Sendable {
     let userPercent: Double
     let systemPercent: Double
     let idlePercent: Double
@@ -45,7 +56,7 @@ struct CPUStats {
     var busyPercent: Double { min(100, max(0, 100 - idlePercent)) }
 }
 
-struct GPUStats {
+struct GPUStats: Sendable {
     let deviceUtilization: Int
     let rendererUtilization: Int
     let tilerUtilization: Int
@@ -55,7 +66,7 @@ struct GPUStats {
     let model: String
 }
 
-struct ProcessMemory: Identifiable {
+struct ProcessMemory: Identifiable, Sendable {
     let id: String
     let name: String
     let pid: Int
@@ -63,15 +74,47 @@ struct ProcessMemory: Identifiable {
     let cpuPercent: Double
 }
 
-/// Headroom thresholds. Shared so the menu bar gauge and the panel can never
-/// disagree about what colour the machine is.
-enum MemoryLevel {
+/// `kern.memorystatus_vm_pressure_level` — the same signal the kernel uses to
+/// decide when to compress, swap and ask apps to free memory.
+enum MemoryPressure: Int, Sendable {
+    case normal = 1, warning = 2, critical = 4
+
+    var label: String {
+        switch self {
+        case .normal: return "Normal"
+        case .warning: return "Warning"
+        case .critical: return "Critical"
+        }
+    }
+}
+
+/// Shared so the menu bar chip and the panel can never disagree about what
+/// colour the machine is.
+enum MemoryLevel: Int, Comparable {
     case ok, warn, critical
+
+    static func < (a: MemoryLevel, b: MemoryLevel) -> Bool { a.rawValue < b.rawValue }
 
     init(availableFraction f: Double) {
         if f > 0.30 { self = .ok }
         else if f > 0.15 { self = .warn }
         else { self = .critical }
+    }
+
+    init(_ pressure: MemoryPressure) {
+        switch pressure {
+        case .normal: self = .ok
+        case .warning: self = .warn
+        case .critical: self = .critical
+        }
+    }
+
+    /// The worse of headroom and kernel pressure. Pressure alone stays "normal"
+    /// on a big machine at 95% used, and headroom alone misses the kernel
+    /// already compressing and swapping; either one can raise the alarm.
+    init(_ stats: MemoryStats) {
+        let headroom = MemoryLevel(availableFraction: stats.availableFraction)
+        self = stats.pressure.map { max(headroom, MemoryLevel($0)) } ?? headroom
     }
 
     var color: Color {
@@ -133,29 +176,50 @@ func getVMStats() -> vm_statistics64? {
     return result == KERN_SUCCESS ? stats : nil
 }
 
-func getSwapUsage() -> UInt64 {
+func getSwapUsage() -> UInt64? {
     var swap = xsw_usage()
     var size = MemoryLayout<xsw_usage>.size
-    sysctlbyname("vm.swapusage", &swap, &size, nil, 0)
+    guard sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0 else {
+        logger.error("sysctl vm.swapusage failed: errno \(errno)")
+        return nil
+    }
     return swap.xsu_used
 }
 
-func readMemoryStats() -> MemoryStats {
+func readMemoryPressure() -> MemoryPressure? {
+    var level: Int32 = 0
+    var len = MemoryLayout<Int32>.size
+    guard sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, nil, 0) == 0 else {
+        logger.error("sysctl kern.memorystatus_vm_pressure_level failed: errno \(errno)")
+        return nil
+    }
+    return MemoryPressure(rawValue: Int(level))
+}
+
+/// The unit host_statistics64 counts pages in. Asked for once via
+/// host_page_size rather than read from the mutable global vm_kernel_page_size.
+let kernelPageSize: UInt64 = {
+    var size: vm_size_t = 0
+    let host = mach_host_self()
+    defer { mach_port_deallocate(mach_task_self_, host) }
+    return host_page_size(host, &size) == KERN_SUCCESS ? UInt64(size) : 16_384
+}()
+
+/// Returns nil when the VM counters cannot be read, so the caller keeps the
+/// last good sample rather than painting an empty machine.
+func readMemoryStats() -> MemoryStats? {
     let total = getPhysicalMemory()
-    let pageSize = UInt64(vm_kernel_page_size)
+    let pageSize = kernelPageSize
 
     guard let vm = getVMStats() else {
-        return MemoryStats(totalBytes: total, usedBytes: 0, activeBytes: 0, inactiveBytes: 0,
-                           wiredBytes: 0, compressedBytes: 0, freeBytes: total, appBytes: 0,
-                           swapUsedBytes: 0)
+        logger.error("host_statistics64(HOST_VM_INFO64) failed")
+        return nil
     }
 
     let active = UInt64(vm.active_count) * pageSize
     let inactive = UInt64(vm.inactive_count) * pageSize
     let wired = UInt64(vm.wire_count) * pageSize
     let compressed = UInt64(vm.compressor_page_count) * pageSize
-    let _ = UInt64(vm.speculative_count) * pageSize
-    let _ = UInt64(vm.free_count) * pageSize
     let purgeable = UInt64(vm.purgeable_count) * pageSize
 
     // Used memory matching Activity Monitor: app memory + wired + compressed
@@ -164,68 +228,15 @@ func readMemoryStats() -> MemoryStats {
     // subtraction can go negative and must be clamped.
     let appMem = saturatingSub(active, purgeable)
     let usedApprox = min(appMem + wired + compressed, total)
-    let swap = getSwapUsage()
 
     return MemoryStats(
         totalBytes: total, usedBytes: usedApprox, activeBytes: active,
         inactiveBytes: inactive, wiredBytes: wired, compressedBytes: compressed,
         freeBytes: saturatingSub(total, usedApprox), appBytes: appMem,
-        swapUsedBytes: swap
+        swapUsedBytes: getSwapUsage() ?? 0,
+        pressure: readMemoryPressure()
     )
 }
-
-// MARK: - Network throughput via getifaddrs
-
-private var previousNetSample: (rx: UInt64, tx: UInt64, at: Date)?
-private let netSampleLock = NSLock()
-
-/// Sums byte counters across every non-loopback interface. Like CPU, throughput
-/// is a rate, so the first call after launch only establishes a baseline.
-func readNetworkStats() -> NetworkStats {
-    var rx: UInt64 = 0, tx: UInt64 = 0
-    var ifaddr: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&ifaddr) == 0, let first = ifaddr else {
-        return NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: false)
-    }
-    defer { freeifaddrs(ifaddr) }
-
-    var ptr: UnsafeMutablePointer<ifaddrs>? = first
-    while let cur = ptr {
-        let name = String(cString: cur.pointee.ifa_name)
-        if cur.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_LINK),
-           !name.hasPrefix("lo"), !name.hasPrefix("gif"), !name.hasPrefix("stf"),
-           let d = cur.pointee.ifa_data?.assumingMemoryBound(to: if_data.self) {
-            rx += UInt64(d.pointee.ifi_ibytes)
-            tx += UInt64(d.pointee.ifi_obytes)
-        }
-        ptr = cur.pointee.ifa_next
-    }
-
-    let now = Date()
-    netSampleLock.lock()
-    let previous = previousNetSample
-    previousNetSample = (rx, tx, now)
-    netSampleLock.unlock()
-
-    guard let prev = previous else {
-        return NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: false)
-    }
-    let elapsed = now.timeIntervalSince(prev.at)
-    guard elapsed > 0 else {
-        return NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: true)
-    }
-
-    // ifi_ibytes / ifi_obytes are 32-bit and wrap every 4 GB. A wrap shows up as
-    // the sum going backwards; drop that one sample rather than report a spike.
-    let down = rx >= prev.rx ? Double(rx - prev.rx) / elapsed : 0
-    let up = tx >= prev.tx ? Double(tx - prev.tx) / elapsed : 0
-    return NetworkStats(downBytesPerSec: down, upBytesPerSec: up, hasBaseline: true)
-}
-
-// MARK: - CPU Stats via Mach
-
-private var previousCPUTicks: host_cpu_load_info?
-private let cpuTicksLock = NSLock()
 
 func sysctlInt(_ name: String) -> Int {
     var value: Int32 = 0
@@ -234,132 +245,179 @@ func sysctlInt(_ name: String) -> Int {
     return Int(value)
 }
 
-/// CPU utilisation is a rate, so it only exists relative to the previous
-/// sample. The first call after launch has no baseline and reports idle.
-func readCPUStats() -> CPUStats {
-    let logical = sysctlInt("hw.logicalcpu")
-    let pCores = sysctlInt("hw.perflevel0.logicalcpu")
-    let eCores = sysctlInt("hw.perflevel1.logicalcpu")
-
-    var info = host_cpu_load_info()
-    var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
-    let host = mach_host_self()
-    let result = withUnsafeMutablePointer(to: &info) { ptr in
-        ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { p in
-            host_statistics(host, HOST_CPU_LOAD_INFO, p, &count)
-        }
-    }
-    mach_port_deallocate(mach_task_self_, host)
-
-    guard result == KERN_SUCCESS else {
-        return CPUStats(userPercent: 0, systemPercent: 0, idlePercent: 100,
-                        logicalCores: logical, performanceCores: pCores, efficiencyCores: eCores)
-    }
-
-    cpuTicksLock.lock()
-    let previous = previousCPUTicks
-    previousCPUTicks = info
-    cpuTicksLock.unlock()
-
-    guard let prev = previous else {
-        return CPUStats(userPercent: 0, systemPercent: 0, idlePercent: 100,
-                        logicalCores: logical, performanceCores: pCores, efficiencyCores: eCores)
-    }
-
-    // Tick counters are monotonic but wrap; clamp so a wrap reports 0 rather
-    // than a nonsense spike.
-    func delta(_ now: UInt32, _ before: UInt32) -> Double {
-        now >= before ? Double(now - before) : 0
-    }
-    let user = delta(info.cpu_ticks.0, prev.cpu_ticks.0)
-    let system = delta(info.cpu_ticks.1, prev.cpu_ticks.1)
-    let idle = delta(info.cpu_ticks.2, prev.cpu_ticks.2)
-    let nice = delta(info.cpu_ticks.3, prev.cpu_ticks.3)
-    let total = user + system + idle + nice
-
-    guard total > 0 else {
-        return CPUStats(userPercent: 0, systemPercent: 0, idlePercent: 100,
-                        logicalCores: logical, performanceCores: pCores, efficiencyCores: eCores)
-    }
-
-    return CPUStats(userPercent: (user + nice) / total * 100,
-                    systemPercent: system / total * 100,
-                    idlePercent: idle / total * 100,
-                    logicalCores: logical, performanceCores: pCores, efficiencyCores: eCores)
+/// One sample of everything the menu bar and the left half of the panel show.
+struct SystemSample: Sendable {
+    let memory: MemoryStats?
+    let cpu: CPUStats?
+    let gpu: GPUStats?
+    let network: NetworkStats?
 }
 
-// MARK: - GPU Stats via IOKit
+// MARK: - Sampler
 
-func readGPUStats() -> GPUStats {
-    var model = "Unknown"
-    var coreCount = 0
-    var deviceUtil = 0
-    var rendererUtil = 0
-    var tilerUtil = 0
-    var inUse: UInt64 = 0
-    var allocated: UInt64 = 0
+/// Owns every piece of state that only means something relative to the
+/// previous sample (CPU ticks, network byte counters) plus values that never
+/// change (core counts, GPU model). Being an actor, reads run off the main
+/// thread and can never overlap — the old Timer + GCD design could start a
+/// new sample while the previous one was still in flight.
+actor SystemSampler {
+    private var previousCPUTicks: host_cpu_load_info?
+    private var previousNet: (rx: UInt64, tx: UInt64, at: ContinuousClock.Instant)?
+    private var loggedFailures: Set<String> = []
 
-    let pipe = Pipe()
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-    proc.arguments = ["-r", "-c", "AGXAccelerator", "-d", "2"]
-    proc.standardOutput = pipe
-    proc.standardError = FileHandle.nullDevice
-    do { try proc.run() } catch { return GPUStats(deviceUtilization: 0, rendererUtilization: 0, tilerUtilization: 0, inUseMemory: 0, allocatedMemory: 0, coreCount: 0, model: "Unknown") }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    proc.waitUntilExit()
+    private let logicalCores = sysctlInt("hw.logicalcpu")
+    private let performanceCores = sysctlInt("hw.perflevel0.logicalcpu")
+    private let efficiencyCores = sysctlInt("hw.perflevel1.logicalcpu")
+    private var gpuIdentity: (model: String, cores: Int)?
 
-    guard let output = String(data: data, encoding: .utf8) else {
-        return GPUStats(deviceUtilization: 0, rendererUtilization: 0, tilerUtilization: 0, inUseMemory: 0, allocatedMemory: 0, coreCount: 0, model: "Unknown")
+    func sample() -> SystemSample {
+        SystemSample(memory: readMemoryStats(), cpu: readCPU(), gpu: readGPU(), network: readNetwork())
     }
 
-    // Parse model
-    if let range = output.range(of: "\"model\" = \"") {
-        let after = output[range.upperBound...]
-        if let end = after.firstIndex(of: "\"") {
-            model = String(after[after.startIndex..<end])
-        }
+    /// A read that fails once will fail every 2 seconds; log it once.
+    private func logOnce(_ key: String, _ message: String) {
+        guard loggedFailures.insert(key).inserted else { return }
+        logger.error("\(message, privacy: .public)")
     }
 
-    // Parse gpu-core-count
-    if let range = output.range(of: "\"gpu-core-count\" = ") {
-        let after = output[range.upperBound...]
-        let numStr = after.prefix(while: { $0.isNumber })
-        coreCount = Int(numStr) ?? 0
-    }
+    // MARK: CPU via host_statistics
 
-    // Parse PerformanceStatistics
-    if let range = output.range(of: "\"PerformanceStatistics\" = {") {
-        let after = output[range.upperBound...]
-        if let end = after.firstIndex(of: "}") {
-            let block = String(after[after.startIndex..<end])
-            func extractInt(_ key: String) -> Int {
-                if let r = block.range(of: "\"\(key)\"=") {
-                    let a = block[r.upperBound...]
-                    let numStr = a.prefix(while: { $0.isNumber || $0 == "-" })
-                    return Int(numStr) ?? 0
-                }
-                return 0
+    /// CPU utilisation is a rate, so it only exists relative to the previous
+    /// sample. The first call after launch has no baseline and reports idle.
+    private func readCPU() -> CPUStats? {
+        var info = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+        let host = mach_host_self()
+        let result = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { p in
+                host_statistics(host, HOST_CPU_LOAD_INFO, p, &count)
             }
-            func extractUInt64(_ key: String) -> UInt64 {
-                if let r = block.range(of: "\"\(key)\"=") {
-                    let a = block[r.upperBound...]
-                    let numStr = a.prefix(while: { $0.isNumber })
-                    return UInt64(numStr) ?? 0
-                }
-                return 0
-            }
-            deviceUtil = extractInt("Device Utilization %")
-            rendererUtil = extractInt("Renderer Utilization %")
-            tilerUtil = extractInt("Tiler Utilization %")
-            inUse = extractUInt64("In use system memory")
-            allocated = extractUInt64("Alloc system memory")
         }
+        mach_port_deallocate(mach_task_self_, host)
+
+        guard result == KERN_SUCCESS else {
+            logOnce("cpu", "host_statistics(HOST_CPU_LOAD_INFO) failed: \(result)")
+            return nil
+        }
+
+        let idleStats = CPUStats(userPercent: 0, systemPercent: 0, idlePercent: 100,
+                                 logicalCores: logicalCores, performanceCores: performanceCores,
+                                 efficiencyCores: efficiencyCores)
+        defer { previousCPUTicks = info }
+        guard let prev = previousCPUTicks else { return idleStats }
+
+        // Tick counters are monotonic but wrap; clamp so a wrap reports 0 rather
+        // than a nonsense spike.
+        func delta(_ now: UInt32, _ before: UInt32) -> Double {
+            now >= before ? Double(now - before) : 0
+        }
+        let user = delta(info.cpu_ticks.0, prev.cpu_ticks.0)
+        let system = delta(info.cpu_ticks.1, prev.cpu_ticks.1)
+        let idle = delta(info.cpu_ticks.2, prev.cpu_ticks.2)
+        let nice = delta(info.cpu_ticks.3, prev.cpu_ticks.3)
+        let total = user + system + idle + nice
+        guard total > 0 else { return idleStats }
+
+        return CPUStats(userPercent: (user + nice) / total * 100,
+                        systemPercent: system / total * 100,
+                        idlePercent: idle / total * 100,
+                        logicalCores: logicalCores, performanceCores: performanceCores,
+                        efficiencyCores: efficiencyCores)
     }
 
-    return GPUStats(deviceUtilization: deviceUtil, rendererUtilization: rendererUtil,
-                    tilerUtilization: tilerUtil, inUseMemory: inUse, allocatedMemory: allocated,
-                    coreCount: coreCount, model: model)
+    // MARK: Network via getifaddrs
+
+    /// Sums byte counters across every non-loopback interface. Like CPU,
+    /// throughput is a rate, so the first call only establishes a baseline.
+    private func readNetwork() -> NetworkStats? {
+        var rx: UInt64 = 0, tx: UInt64 = 0
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else {
+            logOnce("net", "getifaddrs failed: errno \(errno)")
+            return nil
+        }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            let name = String(cString: cur.pointee.ifa_name)
+            if cur.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_LINK),
+               !name.hasPrefix("lo"), !name.hasPrefix("gif"), !name.hasPrefix("stf"),
+               let d = cur.pointee.ifa_data?.assumingMemoryBound(to: if_data.self) {
+                rx += UInt64(d.pointee.ifi_ibytes)
+                tx += UInt64(d.pointee.ifi_obytes)
+            }
+            ptr = cur.pointee.ifa_next
+        }
+
+        let now = ContinuousClock.now
+        defer { previousNet = (rx, tx, now) }
+        guard let prev = previousNet else {
+            return NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: false)
+        }
+        let elapsed = (now - prev.at) / .seconds(1)
+        guard elapsed > 0 else {
+            return NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: true)
+        }
+
+        // ifi_ibytes / ifi_obytes are 32-bit and wrap every 4 GB. A wrap shows up
+        // as the sum going backwards; drop that one sample rather than report a spike.
+        let down = rx >= prev.rx ? Double(rx - prev.rx) / elapsed : 0
+        let up = tx >= prev.tx ? Double(tx - prev.tx) / elapsed : 0
+        return NetworkStats(downBytesPerSec: down, upBytesPerSec: up, hasBaseline: true)
+    }
+
+    // MARK: GPU via IOKit
+
+    /// Reads the AGXAccelerator registry entry directly — the same data
+    /// `ioreg -r -c AGXAccelerator` prints, without spawning a process every
+    /// two seconds or depending on its text format. Nil on Macs without an
+    /// Apple Silicon GPU, or if the entry stops exposing PerformanceStatistics.
+    private func readGPU() -> GPUStats? {
+        // IOServiceGetMatchingService consumes the matching dictionary.
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"))
+        guard service != IO_OBJECT_NULL else {
+            logOnce("gpu-service", "No AGXAccelerator in the IORegistry; GPU stats unavailable")
+            return nil
+        }
+        defer { IOObjectRelease(service) }
+
+        func property(_ key: String) -> Any? {
+            IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue()
+        }
+
+        if gpuIdentity == nil {
+            var model = "Unknown GPU"
+            switch property("model") {
+            case let s as String: model = s
+            case let d as Data:
+                // Some registry entries store strings as NUL-terminated bytes.
+                model = String(decoding: d.prefix { $0 != 0 }, as: UTF8.self)
+            default: break
+            }
+            let cores = (property("gpu-core-count") as? NSNumber)?.intValue ?? 0
+            gpuIdentity = (model, cores)
+        }
+
+        guard let perf = property("PerformanceStatistics") as? [String: Any] else {
+            logOnce("gpu-perf", "AGXAccelerator has no PerformanceStatistics dictionary")
+            return nil
+        }
+        func number(_ key: String) -> NSNumber? { perf[key] as? NSNumber }
+        guard let device = number("Device Utilization %") else {
+            logOnce("gpu-util", "PerformanceStatistics lacks 'Device Utilization %'; keys: \(perf.keys.sorted())")
+            return nil
+        }
+
+        return GPUStats(deviceUtilization: device.intValue,
+                        rendererUtilization: number("Renderer Utilization %")?.intValue ?? 0,
+                        tilerUtilization: number("Tiler Utilization %")?.intValue ?? 0,
+                        inUseMemory: number("In use system memory")?.uint64Value ?? 0,
+                        allocatedMemory: number("Alloc system memory")?.uint64Value ?? 0,
+                        coreCount: gpuIdentity?.cores ?? 0,
+                        model: gpuIdentity?.model ?? "Unknown GPU")
+    }
 }
 
 // MARK: - Physical Footprint (accurate memory, same metric as Activity Monitor)
@@ -376,17 +434,28 @@ func getPhysFootprint(_ pid: Int32) -> UInt64 {
 
 // MARK: - Top Processes by Memory
 
-func readTopProcesses(limit: Int = 30) -> [ProcessMemory] {
+/// `ps` stays deliberately: proc_pid_rusage / proc_pidinfo are refused for
+/// processes owned by other users (WindowServer, mds_stores, launchd, ~160
+/// daemons), while the system `ps` can still report their RSS. Dropping it
+/// would hide them from the list. It only runs while the panel is open.
+/// Returns nil if `ps` could not be run, so the panel keeps the last list.
+func readTopProcesses(limit: Int = 30) -> [ProcessMemory]? {
     let pipe = Pipe()
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/bin/ps")
     proc.arguments = ["-eo", "pid,rss,pcpu,comm", "-r"]
     proc.standardOutput = pipe
     proc.standardError = FileHandle.nullDevice
-    do { try proc.run() } catch { return [] }
+    do { try proc.run() } catch {
+        logger.error("Could not run /bin/ps: \(error.localizedDescription, privacy: .public)")
+        return nil
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
-    guard let output = String(data: data, encoding: .utf8) else { return [] }
+    guard proc.terminationStatus == 0, let output = String(data: data, encoding: .utf8) else {
+        logger.error("/bin/ps exited with status \(proc.terminationStatus)")
+        return nil
+    }
 
     var results: [ProcessMemory] = []
     let lines = output.split(separator: "\n").dropFirst() // skip header
@@ -434,66 +503,73 @@ func readTopProcesses(limit: Int = 30) -> [ProcessMemory] {
 
 // MARK: - Monitor
 
-class SystemMonitor: ObservableObject {
-    @Published var memoryStats = MemoryStats(totalBytes: 0, usedBytes: 0, activeBytes: 0, inactiveBytes: 0, wiredBytes: 0, compressedBytes: 0, freeBytes: 0, appBytes: 0, swapUsedBytes: 0)
-    @Published var gpuStats = GPUStats(deviceUtilization: 0, rendererUtilization: 0, tilerUtilization: 0, inUseMemory: 0, allocatedMemory: 0, coreCount: 0, model: "")
-    @Published var cpuStats = CPUStats(userPercent: 0, systemPercent: 0, idlePercent: 100, logicalCores: 0, performanceCores: 0, efficiencyCores: 0)
-    @Published var networkStats = NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: false)
-    @Published var processes: [ProcessMemory] = []
-    @Published var processSortKey: ProcessSortKey = .memory
-    @Published var processSortAscending: Bool = false
+@Observable @MainActor
+final class SystemMonitor {
+    var memoryStats = MemoryStats.empty
+    /// Nil when the GPU cannot be read (non-Apple-Silicon, registry changes);
+    /// the UI shows a dash rather than a convincing 0%.
+    var gpuStats: GPUStats?
+    var cpuStats = CPUStats(userPercent: 0, systemPercent: 0, idlePercent: 100, logicalCores: 0, performanceCores: 0, efficiencyCores: 0)
+    var networkStats = NetworkStats(downBytesPerSec: 0, upBytesPerSec: 0, hasBaseline: false)
+    var processes: [ProcessMemory] = []
+    var processSortKey: ProcessSortKey = .memory
+    var processSortAscending: Bool = false
 
-    /// Called on the main queue after each sample lands, so non-SwiftUI
+    /// Called on the main actor after each sample lands, so non-SwiftUI
     /// observers (the menu bar item) can refresh too.
-    var onUpdate: (() -> Void)?
+    @ObservationIgnored var onUpdate: (() -> Void)?
 
-    private var fastTimer: Timer?
-    private var slowTimer: Timer?
+    @ObservationIgnored private let sampler = SystemSampler()
+    @ObservationIgnored private var sampleTask: Task<Void, Never>?
+    @ObservationIgnored private var processTask: Task<Void, Never>?
+
+    private static let sampleInterval: Duration = .seconds(2)
+    private static let processInterval: Duration = .seconds(3)
 
     init() {
-        refresh()
-        refreshProcesses()
-        // Memory + GPU stats every 2s
-        fastTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
-        // Process list every 5s (ps is heavier)
-        slowTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.refreshProcesses()
-        }
-    }
-
-    deinit {
-        fastTimer?.invalidate()
-        slowTimer?.invalidate()
-    }
-
-    func refresh() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let mem = readMemoryStats()
-            let gpu = readGPUStats()
-            let cpu = readCPUStats()
-            let net = readNetworkStats()
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.memoryStats = mem
-                self.gpuStats = gpu
-                self.cpuStats = cpu
-                self.networkStats = net
-
-                self.onUpdate?()
+        // The menu bar shows memory all the time, so this loop never stops.
+        // Each iteration awaits its sample before sleeping, so samples can
+        // never pile up behind a slow read.
+        sampleTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let sampler = self?.sampler else { return }
+                let sample = await sampler.sample()
+                self?.apply(sample)
+                try? await Task.sleep(for: Self.sampleInterval)
             }
         }
     }
 
-    func refreshProcesses() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let procs = readTopProcesses()
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.processes = self.sortProcesses(procs)
+    private func apply(_ sample: SystemSample) {
+        // Memory and CPU reads essentially never fail; if one does, it has
+        // been logged and the last good value stays up.
+        if let mem = sample.memory { memoryStats = mem }
+        if let cpu = sample.cpu { cpuStats = cpu }
+        if let net = sample.network { networkStats = net }
+        gpuStats = sample.gpu
+        onUpdate?()
+    }
+
+    /// The process list is only visible in the panel, and a full scan
+    /// (`ps` plus a proc_pid_rusage per PID) is the heaviest thing Statter
+    /// does — so it runs only while the panel is open.
+    func setPanelVisible(_ visible: Bool) {
+        processTask?.cancel()
+        processTask = nil
+        guard visible else { return }
+        processTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let procs = await Self.scanProcesses()
+                guard !Task.isCancelled, let self else { return }
+                if let procs { self.processes = self.sortProcesses(procs) }
+                try? await Task.sleep(for: Self.processInterval)
             }
         }
+    }
+
+    /// nonisolated + async: runs on the global executor, off the main thread.
+    nonisolated private static func scanProcesses() async -> [ProcessMemory]? {
+        readTopProcesses()
     }
 
     func sortProcesses(_ procs: [ProcessMemory]) -> [ProcessMemory] {
@@ -709,7 +785,7 @@ struct MetricCard<Content: View>: View {
 struct ContentView: View {
     // Owned by the AppDelegate so the menu bar item and this panel read the
     // same samples.
-    @ObservedObject var monitor: SystemMonitor
+    @Bindable var monitor: SystemMonitor
 
     private var availableGB: Double {
         Double(monitor.memoryStats.availableBytes) / 1_073_741_824
@@ -719,7 +795,7 @@ struct ContentView: View {
         return t == 0 ? 0 : Double(monitor.memoryStats.usedBytes) / Double(t) * 100
     }
     private var memoryTint: Color {
-        MemoryLevel(availableFraction: monitor.memoryStats.availableFraction).color
+        MemoryLevel(monitor.memoryStats).color
     }
     private var cpuTint: Color {
         let b = monitor.cpuStats.busyPercent
@@ -750,6 +826,12 @@ struct ContentView: View {
         .background(.background)
     }
 
+    private var subtitle: String {
+        let cpu = "\(monitor.cpuStats.logicalCores) CPU cores"
+        guard let gpu = monitor.gpuStats else { return "\(cpu) \u{2022} GPU unavailable" }
+        return "\(gpu.model) \u{2022} \(cpu) \u{2022} \(gpu.coreCount) GPU cores"
+    }
+
     // MARK: Header
 
     private var header: some View {
@@ -757,7 +839,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Statter")
                     .font(.system(size: 20, weight: .bold))
-                Text("\(monitor.gpuStats.model) \u{2022} \(monitor.cpuStats.logicalCores) CPU cores \u{2022} \(monitor.gpuStats.coreCount) GPU cores")
+                Text(subtitle)
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
@@ -839,6 +921,12 @@ struct ContentView: View {
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    if let pressure = monitor.memoryStats.pressure {
+                        Text("Pressure: \(pressure.label)")
+                            .font(.system(size: 10, weight: pressure == .normal ? .regular : .semibold))
+                            .foregroundColor(pressure == .normal ? .secondary : MemoryLevel(pressure).color)
+                            .help("The kernel\u{2019}s own memory pressure level \u{2014} what macOS acts on when it compresses, swaps or asks apps to free memory.")
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -872,16 +960,21 @@ struct ContentView: View {
     }
 
     private var gpuCard: some View {
-        MetricCard(tint: .green) {
+        let gpu = monitor.gpuStats
+        return MetricCard(tint: .green) {
             MetricCardHeader(title: "GPU", icon: "display",
-                             value: "\(monitor.gpuStats.deviceUtilization)%", tint: .green)
+                             value: gpu.map { "\($0.deviceUtilization)%" } ?? "\u{2014}", tint: .green)
             HStack(alignment: .top, spacing: 6) {
-                VerticalCapacityBarView(fraction: Double(monitor.gpuStats.deviceUtilization) / 100, tint: .green,
+                VerticalCapacityBarView(fraction: Double(gpu?.deviceUtilization ?? 0) / 100, tint: .green,
                                         scaleLabels: compactPercentLabels, barWidth: 6, height: 58)
                 VStack(alignment: .leading, spacing: 3) {
-                    cardDetail("Rend \(monitor.gpuStats.rendererUtilization)%")
-                    cardDetail("Tiler \(monitor.gpuStats.tilerUtilization)%")
-                    cardDetail("\(formatMemory(monitor.gpuStats.allocatedMemory)) mapped")
+                    if let gpu {
+                        cardDetail("Rend \(gpu.rendererUtilization)%")
+                        cardDetail("Tiler \(gpu.tilerUtilization)%")
+                        cardDetail("\(formatMemory(gpu.allocatedMemory)) mapped")
+                    } else {
+                        cardDetail("Not readable on this Mac")
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -941,8 +1034,10 @@ struct ContentView: View {
 
     private var unifiedPoolBar: some View {
         let total = Double(max(monitor.memoryStats.totalBytes, 1))
-        let gpuAlloc = Double(monitor.gpuStats.allocatedMemory)
-        let gpuActive = Double(monitor.gpuStats.inUseMemory)
+        let gpu = monitor.gpuStats
+        let gpuAlloc = Double(gpu?.allocatedMemory ?? 0)
+        let gpuActive = Double(gpu?.inUseMemory ?? 0)
+        let gpuLabel: (UInt64?) -> String = { $0.map(formatMemory) ?? "\u{2014}" }
         let available = Double(monitor.memoryStats.availableBytes)
         let gpuShown = min(gpuAlloc, total - available)
         let otherUsed = max(0, total - gpuShown - available)
@@ -967,9 +1062,9 @@ struct ContentView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 14) {
-                    legendSwatch(.green, "GPU active \(formatMemory(monitor.gpuStats.inUseMemory))")
+                    legendSwatch(.green, "GPU active \(gpuLabel(gpu?.inUseMemory))")
                     Spacer(minLength: 0)
-                    legendSwatch(.green.opacity(0.3), "GPU mapped \(formatMemory(monitor.gpuStats.allocatedMemory))")
+                    legendSwatch(.green.opacity(0.3), "GPU mapped \(gpuLabel(gpu?.allocatedMemory))")
                     Spacer(minLength: 0)
                 }
                 HStack(spacing: 14) {
@@ -981,8 +1076,8 @@ struct ContentView: View {
             }
             .foregroundColor(.secondary)
 
-            if monitor.gpuStats.allocatedMemory > 10_000_000_000 {
-                Text("GPU has mapped \(formatMemory(monitor.gpuStats.allocatedMemory)) of your unified memory (likely model weights for local AI). This isn\u{2019}t separate VRAM \u{2014} it\u{2019}s your RAM, shared with the GPU.")
+            if let gpu, gpu.allocatedMemory > 10_000_000_000 {
+                Text("GPU has mapped \(formatMemory(gpu.allocatedMemory)) of your unified memory (likely model weights for local AI). This isn\u{2019}t separate VRAM \u{2014} it\u{2019}s your RAM, shared with the GPU.")
                     .font(.system(size: 9))
                     .foregroundColor(.secondary)
             }
@@ -1065,7 +1160,8 @@ struct ContentView: View {
 
 // MARK: - App Delegate for Menu Bar
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     let monitor = SystemMonitor()
@@ -1086,6 +1182,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Must match ContentView's frame, or the popover shows dead space.
         popover.contentSize = NSSize(width: 810, height: 480)
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: ContentView(monitor: monitor))
         self.popover = popover
 
@@ -1151,7 +1248,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Before the first sample lands there is nothing honest to show.
         guard mem.totalBytes > 0 else { return }
 
-        let level = MemoryLevel(availableFraction: mem.availableFraction)
+        let level = MemoryLevel(mem)
         let usedFraction = Double(mem.usedBytes) / Double(mem.totalBytes)
 
         // The chip carries the headroom colour; the digits stay in the menu bar's
@@ -1174,7 +1271,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Statter
         \(formatMemory(mem.usedBytes)) RAM used of \(formatMemory(mem.totalBytes)) (\(Int(usedFraction * 100))%)
         \(formatMemory(mem.availableBytes)) available
-        GPU \(monitor.gpuStats.deviceUtilization)% \u{2022} \(formatMemory(monitor.gpuStats.allocatedMemory)) mapped
+        \(mem.pressure.map { "Memory pressure: \($0.label)" } ?? "Memory pressure: unknown")
+        \(monitor.gpuStats.map { "GPU \($0.deviceUtilization)% \u{2022} \(formatMemory($0.allocatedMemory)) mapped" } ?? "GPU unavailable")
         """
     }
 
@@ -1192,13 +1290,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         togglePopover()
     }
 
+    // The process scan follows the panel: started as it opens, stopped as it
+    // closes, whichever way it was dismissed.
+    func popoverWillShow(_ notification: Notification) { monitor.setPanelVisible(true) }
+    func popoverDidClose(_ notification: Notification) { monitor.setPanelVisible(false) }
+
     @objc func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             popover.contentViewController?.view.window?.makeKey()
         }
     }

@@ -11,14 +11,22 @@ SwiftUI menu bar app for monitoring macOS GPU and memory stats.
 - **CPU and GPU stack beside it** as compact cards, each with the same thin stick gauge, so all three read on one visual grammar without spending width on chunky bars.
 - **Network throughput** — live download and upload rates from `getifaddrs` byte counters.
 - **"Where it is going"** — a unified memory pool visualization showing GPU-mapped memory, apps/OS, and available space as competing claims on one shared pool — no more pretending GPU has its own VRAM
-- Live Apple Silicon GPU utilization from `AGXAccelerator` `PerformanceStatistics`
+- Live Apple Silicon GPU utilization read straight from the `AGXAccelerator` IORegistry entry — no `ioreg` subprocess
+- **Kernel memory pressure** (`kern.memorystatus_vm_pressure_level`) shown in the RAM card and folded into the chip colour
 - **Physical footprint** for per-process memory (the same metric Activity Monitor uses) instead of RSS, which inflates numbers by counting shared pages multiple times
 - Swap usage with contextual explanation
 - **System-wide CPU utilization** with user/system split and P/E core counts, read from `host_statistics(HOST_CPU_LOAD_INFO)`
 
 ## How measurement works
 
-Statter uses macOS system interfaces and command-line tools rather than private frameworks.
+Statter uses public macOS system interfaces rather than private frameworks. The only subprocess is `ps`, and it only runs while the panel is open (see below).
+
+### Sampling
+
+- One `@Observable` model on the main actor. A single `Task` loop asks a `SystemSampler` actor for a sample every 2 seconds, so reads happen off the main thread and a slow read can never overlap the next one.
+- The process list has its own loop (every 3 seconds) that starts when the panel opens and stops when it closes. With the panel closed, Statter spawns no processes at all.
+- The app compiles in Swift 6 language mode, so data races are compile errors.
+- Failed reads go to the unified log (`log stream --predicate 'subsystem == "com.hpal007.statter"'`) instead of silently turning into zeros; an unreadable GPU shows `—`.
 
 ### Memory
 
@@ -26,6 +34,7 @@ Statter uses macOS system interfaces and command-line tools rather than private 
 - Memory breakdown comes from `host_statistics64(HOST_VM_INFO64)`, using page counters such as active, inactive, wired, compressed, speculative, free, and purgeable.
 - **Available memory** is computed as `total - used`, where used follows Activity Monitor's formula: `used = app memory + wired + compressed`, with app memory taken as `active - purgeable`. Inactive, speculative, purgeable, and free pages are all treated as available, because macOS can reclaim them on demand. Every subtraction is clamped at zero and `used` is capped at physical RAM, since the page counters are sampled independently and are not guaranteed to be mutually consistent.
 - Swap usage comes from `sysctl vm.swapusage`.
+- Memory pressure comes from `sysctl kern.memorystatus_vm_pressure_level` (normal / warning / critical) — the level the kernel itself acts on. The chip and RAM tint use the worse of this and the headroom thresholds (30% / 15% available): pressure alone stays "normal" on a large machine that is 95% used, while headroom alone misses the kernel already compressing and swapping.
 
 ### Network
 
@@ -42,7 +51,7 @@ Statter uses macOS system interfaces and command-line tools rather than private 
 
 On Apple Silicon, there is no separate VRAM. The CPU and GPU share the same physical memory pool. Statter shows this as a single unified bar rather than separate sections:
 
-- GPU model, core count, utilization, and tracked memory come from `/usr/sbin/ioreg -r -c AGXAccelerator -d 2`, specifically the `PerformanceStatistics` dictionary.
+- GPU model, core count, utilization, and tracked memory are read from the `AGXAccelerator` IORegistry entry with `IOServiceGetMatchingService` + `IORegistryEntryCreateCFProperty`, specifically its `PerformanceStatistics` dictionary. Model and core count are read once and cached.
 - **GPU mapped** (`Alloc system memory` from IOKit) is the total memory the GPU driver has reserved. On machines running local AI models, this can be very large (e.g. 70 GB for a large LLM) because the model weights are memory-mapped for GPU access.
 - **GPU active** (`In use system memory` from IOKit) is the subset actively being read/written by the GPU right now.
 - The gap between mapped and active is memory that's allocated (often wired/pinned) but idle — for example, model weights that aren't being processed this instant.
@@ -50,17 +59,17 @@ On Apple Silicon, there is no separate VRAM. The CPU and GPU share the same phys
 
 ### Per-process memory
 
-- Process list comes from `ps -eo pid,rss,pcpu,comm -r`, and **every** returned process is measured. Earlier versions kept only the first 200 rows, but `ps -r` orders by CPU, so idle-but-memory-heavy processes were silently missing from what is a memory panel.
+- Process list comes from `ps -eo pid,rss,pcpu,comm -r`, and **every** returned process is measured. `ps` is kept on purpose: `proc_pid_rusage` and `proc_pidinfo` are refused for processes owned by other users (WindowServer, `mds_stores`, `launchd` and ~160 other daemons), but `ps` can still report their RSS, so replacing it would hide them. Earlier versions kept only the first 200 rows, but `ps -r` orders by CPU, so idle-but-memory-heavy processes were silently missing from what is a memory panel.
 - Each process's memory is measured using **physical footprint** via `proc_pid_rusage(RUSAGE_INFO_V4)` and the `ri_phys_footprint` field. This is the same metric Activity Monitor shows in its "Memory" column. It avoids the problem where RSS (Resident Set Size) double-counts shared libraries and memory-mapped files across processes.
 - Processes are aggregated by executable name with a count shown (e.g. `node (10)`).
 - If `proc_pid_rusage` fails for a process (e.g. insufficient permissions for system processes), Statter falls back to RSS from `ps`.
 
 ### Important limitations
 
-- GPU stats are Apple-Silicon-specific. The current implementation depends on `AGXAccelerator`, so non-AGX Macs may show `Unknown` and zeroed GPU values.
-- There is no memory-pressure readout. Available memory and swap usage are shown instead; neither is a substitute for the kernel's real VM pressure level.
+- GPU stats are Apple-Silicon-specific. The current implementation depends on `AGXAccelerator`, so non-AGX Macs show `—` for the GPU.
+- Per-process CPU is `ps`'s `%cpu`, a decaying average rather than an instantaneous rate.
 - The unified pool bar shows GPU-mapped, Apps/OS, and Available as non-overlapping segments, but in reality GPU allocations overlap with the wired memory category. The bar caps GPU-mapped at `total - available` to ensure it never exceeds 100%.
-- The `ioreg` parsing is text-based, so future macOS formatting changes could break some fields.
+- `PerformanceStatistics` key names are undocumented and could change in a future macOS; a missing key is logged rather than shown as 0.
 - Process aggregation by binary name can merge unrelated processes with the same executable name.
 
 ## Building

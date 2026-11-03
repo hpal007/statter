@@ -11,7 +11,7 @@ BUNDLE_ID="com.hpal007.statter"
 VERSION="1.0"
 
 echo "==> Compiling"
-swiftc -O -parse-as-library \
+swiftc -O -parse-as-library -swift-version 6 -target "$(uname -m)-apple-macos14.0" \
     -framework SwiftUI -framework AppKit -framework IOKit \
     -o statter StatterApp.swift
 
